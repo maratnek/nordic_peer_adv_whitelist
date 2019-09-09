@@ -199,78 +199,15 @@ static void conn_params_error_handler(uint32_t nrf_error)
 }
 
 
-/**@brief Function for handling Scanning Module events.
- */
-static void scan_evt_handler(scan_evt_t const * p_scan_evt)
+
+
+void scan_stop()
 {
-    ret_code_t err_code;
-
-    switch(p_scan_evt->scan_evt_id)
-    {
-        case NRF_BLE_SCAN_EVT_CONNECTING_ERROR:
-        {
-            err_code = p_scan_evt->params.connecting_err.err_code;
-            APP_ERROR_CHECK(err_code);
-        } break;
-
-        default:
-            break;
-    }
+    nrf_ble_scan_stop();
 }
 
 
-/**@brief Function for initializing the scanning and setting the filters.
- */
-static void scan_init(void)
-{
-    ret_code_t          err_code;
-    ble_uuid_t          target_uuid = 
-    {
-        .uuid = BLE_UUID_HEART_RATE_SERVICE,
-        .type = BLE_UUID_TYPE_BLE
-    };
-    nrf_ble_scan_init_t init_scan;
-
-    memset(&init_scan, 0, sizeof(init_scan));
-
-    init_scan.connect_if_match = true;
-    init_scan.conn_cfg_tag     = APP_BLE_CONN_CFG_TAG;
-
-    err_code = nrf_ble_scan_init(&m_scan, &init_scan, scan_evt_handler);
-    APP_ERROR_CHECK(err_code);
-
-    if (strlen(m_target_periph_name) != 0)
-    {
-        err_code = nrf_ble_scan_filter_set(&m_scan, 
-                                           SCAN_NAME_FILTER, 
-                                           m_target_periph_name);
-        APP_ERROR_CHECK(err_code);
-    }
-
-    err_code = nrf_ble_scan_filter_set(&m_scan, 
-                                       SCAN_UUID_FILTER, 
-                                       &target_uuid);
-    APP_ERROR_CHECK(err_code);
-
-    err_code = nrf_ble_scan_filters_enable(&m_scan, 
-                                           NRF_BLE_SCAN_NAME_FILTER | NRF_BLE_SCAN_UUID_FILTER, 
-                                           false);
-    APP_ERROR_CHECK(err_code);
-}
-
-
-/**@brief Function for initializing the scanning.
- */
-static void scan_start(void)
-{
-    ret_code_t err_code;
-
-    err_code = nrf_ble_scan_start(&m_scan);
-    APP_ERROR_CHECK(err_code);
-
-    NRF_LOG_INFO("Scanning");
-}
-
+static bool                  m_whitelist_disabled;        /**< True if whitelist has been temporarily disabled. */
 /**@brief Fetch the list of peer manager peer IDs.
  *
  * @param[inout] p_peers   The buffer where to store the list of peer IDs.
@@ -317,6 +254,182 @@ void prepare_for_whitelist()
             APP_ERROR_CHECK(ret);
         }
 }
+
+static void whitelist_load()
+{
+    ret_code_t   ret;
+    pm_peer_id_t peers[8];
+    uint32_t     peer_cnt;
+
+    memset(peers, PM_PEER_ID_INVALID, sizeof(peers));
+    peer_cnt = (sizeof(peers) / sizeof(pm_peer_id_t));
+
+    // Load all peers from flash and whitelist them.
+    peer_list_get(peers, &peer_cnt);
+
+    ret = pm_whitelist_set(peers, peer_cnt);
+    APP_ERROR_CHECK(ret);
+
+    // Setup the device identies list.
+    // Some SoftDevices do not support this feature.
+    ret = pm_device_identities_list_set(peers, peer_cnt);
+    if (ret != NRF_ERROR_NOT_SUPPORTED)
+    {
+        APP_ERROR_CHECK(ret);
+    }
+}
+
+static void on_whitelist_req(void)
+{
+    ret_code_t err_code;
+
+    // Whitelist buffers.
+    ble_gap_addr_t whitelist_addrs[8];
+    ble_gap_irk_t  whitelist_irks[8];
+
+    memset(whitelist_addrs, 0x00, sizeof(whitelist_addrs));
+    memset(whitelist_irks,  0x00, sizeof(whitelist_irks));
+
+    uint32_t addr_cnt = (sizeof(whitelist_addrs) / sizeof(ble_gap_addr_t));
+    uint32_t irk_cnt  = (sizeof(whitelist_irks)  / sizeof(ble_gap_irk_t));
+
+    // Reload the whitelist and whitelist all peers.
+    whitelist_load();
+
+    // Get the whitelist previously set using pm_whitelist_set().
+    err_code = pm_whitelist_get(whitelist_addrs, &addr_cnt,
+                                whitelist_irks,  &irk_cnt);
+
+    if (((addr_cnt == 0) && (irk_cnt == 0)) ||
+        (m_whitelist_disabled))
+    {
+        NRF_LOG_INFO(" Don't use whitelist.");
+        err_code = nrf_ble_scan_params_set(&m_scan, NULL);
+        APP_ERROR_CHECK(err_code);
+    }
+}
+
+
+/**@brief Function for handling Scanning Module events.
+ */
+static void scan_evt_handler(scan_evt_t const * p_scan_evt)
+{
+    ret_code_t err_code;
+
+    switch(p_scan_evt->scan_evt_id)
+    {
+    case NRF_BLE_SCAN_EVT_WHITELIST_REQUEST:
+        {
+            NRF_LOG_INFO("NRF_BLE_SCAN_EVT_WHITELIST_REQUEST.");
+            on_whitelist_req();
+            m_whitelist_disabled = false;
+        } break;
+
+        case NRF_BLE_SCAN_EVT_CONNECTING_ERROR:
+        {
+            err_code = p_scan_evt->params.connecting_err.err_code;
+            APP_ERROR_CHECK(err_code);
+        } break;
+
+        case NRF_BLE_SCAN_EVT_SCAN_TIMEOUT:
+        {
+            NRF_LOG_INFO("Scan timed out.");
+            //scan_start();
+        } break;
+
+        case NRF_BLE_SCAN_EVT_WHITELIST_ADV_REPORT:
+            NRF_LOG_INFO("NRF_BLE_SCAN_EVT_WHITELIST_ADV_REPORT. Found device from whitelist");
+            NRF_LOG_HEXDUMP_INFO(p_scan_evt->params.p_whitelist_adv_report->peer_addr.addr, sizeof(p_scan_evt->params.p_whitelist_adv_report->peer_addr.addr));
+            scan_stop();
+            err_code = ble_advertising_start(&m_advertising, BLE_ADV_MODE_FAST);
+           APP_ERROR_CHECK(err_code);
+           NRF_LOG_INFO("Advertising");
+            break;
+
+        default:
+            break;
+    }
+
+}
+
+#define SCAN_DURATION_WITELIST      3000                                /**< Duration of the scanning in units of 10 milliseconds. */
+
+/**< Scan parameters requested for scanning and connection. */
+static ble_gap_scan_params_t const m_scan_param =
+{
+    .active        = 0x01,
+    .interval      = NRF_BLE_SCAN_SCAN_INTERVAL,
+    .window        = NRF_BLE_SCAN_SCAN_WINDOW,
+    .filter_policy = BLE_GAP_SCAN_FP_WHITELIST,
+    .timeout       = SCAN_DURATION_WITELIST,
+    .scan_phys     = BLE_GAP_PHY_1MBPS,
+};
+
+/**@brief Function for initializing the scanning and setting the filters.
+ */
+static void scan_init(void)
+{
+    ret_code_t          err_code;
+    //ble_uuid_t          target_uuid = 
+    //{
+    //    .uuid = BLE_UUID_HEART_RATE_SERVICE,
+    //    .type = BLE_UUID_TYPE_BLE
+    //};
+    nrf_ble_scan_init_t init_scan;
+
+    memset(&init_scan, 0, sizeof(init_scan));
+
+    init_scan.p_scan_param     = &m_scan_param;
+    //init_scan.connect_if_match = true;
+    init_scan.connect_if_match = false;
+    init_scan.conn_cfg_tag     = APP_BLE_CONN_CFG_TAG;
+
+    err_code = nrf_ble_scan_init(&m_scan, &init_scan, scan_evt_handler);
+    APP_ERROR_CHECK(err_code);
+
+    //if (strlen(m_target_periph_name) != 0)
+    //{
+    //    err_code = nrf_ble_scan_filter_set(&m_scan, 
+    //                                       SCAN_NAME_FILTER, 
+    //                                       m_target_periph_name);
+    //    APP_ERROR_CHECK(err_code);
+    //}
+
+    //err_code = nrf_ble_scan_filter_set(&m_scan, 
+    //                                   SCAN_UUID_FILTER, 
+    //                                   &target_uuid);
+    //APP_ERROR_CHECK(err_code);
+
+    //if (is_connect_per_addr)
+    //{
+    //   err_code = nrf_ble_scan_filter_set(&m_scan,
+    //                                      SCAN_ADDR_FILTER,
+    //                                      m_target_periph_addr.addr);
+    //   APP_ERROR_CHECK(err_code);
+    //}
+
+    err_code = nrf_ble_scan_filters_enable(&m_scan, 
+                                           //NRF_BLE_SCAN_NAME_FILTER | NRF_BLE_SCAN_UUID_FILTER, 
+                                           //SCAN_ADDR_FILTER,
+                                           NRF_BLE_SCAN_ALL_FILTER,
+                                           false);
+    APP_ERROR_CHECK(err_code);
+}
+
+
+/**@brief Function for initializing the scanning.
+ */
+static void scan_start(void)
+{
+    ret_code_t err_code;
+
+    err_code = nrf_ble_scan_start(&m_scan);
+    APP_ERROR_CHECK(err_code);
+
+    NRF_LOG_INFO("Scanning");
+}
+
+
 
 
 /**@brief Function for initializing the advertising and the scanning.
@@ -424,13 +537,13 @@ static void pm_evt_handler(pm_evt_t const * p_evt)
                     m_whitelist_peers[m_whitelist_peer_cnt++] = m_peer_id;
 
                     // The whitelist has been modified, update it in the Peer Manager.
-                    ret_code_t err_code = pm_device_identities_list_set(m_whitelist_peers, m_whitelist_peer_cnt);
-                    if (err_code != NRF_ERROR_NOT_SUPPORTED)
-                    {
-                        APP_ERROR_CHECK(err_code);
-                    }
+                    //ret_code_t err_code = pm_device_identities_list_set(m_whitelist_peers, m_whitelist_peer_cnt);
+                    //if (err_code != NRF_ERROR_NOT_SUPPORTED)
+                    //{
+                    //    APP_ERROR_CHECK(err_code);
+                    //}
 
-                    err_code = pm_whitelist_set(m_whitelist_peers, m_whitelist_peer_cnt);
+                    ret_code_t err_code = pm_whitelist_set(m_whitelist_peers, m_whitelist_peer_cnt);
                     APP_ERROR_CHECK(err_code);
                 }
             }
@@ -607,6 +720,7 @@ static void on_ble_evt(uint16_t conn_handle, ble_evt_t const * p_ble_evt)
 
         case BLE_GAP_EVT_DISCONNECTED:
             memset(&m_connected_peers[conn_handle], 0x00, sizeof(m_connected_peers[0]));
+            scan_start();
             break;
 
         case BLE_GAP_EVT_SEC_PARAMS_REQUEST:
@@ -909,15 +1023,16 @@ static void ble_evt_handler(ble_evt_t const * p_ble_evt, void * p_context)
 
     on_ble_evt(conn_handle, p_ble_evt);
 
-    if (role == BLE_GAP_ROLE_PERIPH)
-    {
-        // Manages peripheral LEDs.
-        on_ble_peripheral_evt(p_ble_evt);
-    }
-    else if ((role == BLE_GAP_ROLE_CENTRAL) || (p_ble_evt->header.evt_id == BLE_GAP_EVT_ADV_REPORT))
-    {
-        on_ble_central_evt(p_ble_evt);
-    }
+    //if (role == BLE_GAP_ROLE_PERIPH)
+    //{
+    //    // Manages peripheral LEDs.
+    //    on_ble_peripheral_evt(p_ble_evt);
+    //}
+    //else if ((role == BLE_GAP_ROLE_CENTRAL) || (p_ble_evt->header.evt_id == BLE_GAP_EVT_ADV_REPORT))
+    //{
+    //    NRF_LOG_INFO("Found device from Whitelist");
+    //    //on_ble_central_evt(p_ble_evt);
+    //}
 }
 
 
@@ -975,23 +1090,23 @@ static void identities_set(pm_peer_id_list_skip_t skip)
     APP_ERROR_CHECK(err_code);
 }
 
-void ble_adv_whitelist_request()
-{
-ret_code_t err_code;
-  NRF_LOG_INFO("BLE_ADV_EVT_WHITELIST_REQUEST");
-  ble_gap_addr_t whitelist_addrs[BLE_GAP_WHITELIST_ADDR_MAX_COUNT];
-  ble_gap_irk_t whitelist_irks[BLE_GAP_WHITELIST_ADDR_MAX_COUNT];
-  uint32_t addr_cnt = BLE_GAP_WHITELIST_ADDR_MAX_COUNT;
-  uint32_t irk_cnt = BLE_GAP_WHITELIST_ADDR_MAX_COUNT;
-
-  err_code = pm_whitelist_get(whitelist_addrs, &addr_cnt,
-      whitelist_irks, &irk_cnt);
-  APP_ERROR_CHECK(err_code);
-
-  NRF_LOG_INFO("pm_whitelist_get returns %d addr in whitelist and %d irk whitelist",
-      addr_cnt,
-      irk_cnt);
-
+//void ble_adv_whitelist_request()
+//{
+//ret_code_t err_code;
+//  NRF_LOG_INFO("BLE_ADV_EVT_WHITELIST_REQUEST");
+//  ble_gap_addr_t whitelist_addrs[BLE_GAP_WHITELIST_ADDR_MAX_COUNT];
+//  ble_gap_irk_t whitelist_irks[BLE_GAP_WHITELIST_ADDR_MAX_COUNT];
+//  uint32_t addr_cnt = BLE_GAP_WHITELIST_ADDR_MAX_COUNT;
+//  uint32_t irk_cnt = BLE_GAP_WHITELIST_ADDR_MAX_COUNT;
+//
+//  err_code = pm_whitelist_get(whitelist_addrs, &addr_cnt,
+//      whitelist_irks, &irk_cnt);
+//  APP_ERROR_CHECK(err_code);
+//
+//  NRF_LOG_INFO("pm_whitelist_get returns %d addr in whitelist and %d irk whitelist",
+//      addr_cnt,
+//      irk_cnt);
+//
   // Set the correct identities list (no excluding peers with no Central Address Resolution).
   //identities_set(PM_PEER_ID_LIST_SKIP_NO_IRK);
 
@@ -1002,7 +1117,7 @@ ret_code_t err_code;
   //    whitelist_irks,
   //    irk_cnt);
   //APP_ERROR_CHECK(err_code);
-}
+//}
 
 /**@brief Function for initializing the Peer Manager. */
 static void peer_manager_init(void)
@@ -1348,6 +1463,7 @@ static void advertising_init(void)
     init.advdata.uuids_complete.uuid_cnt = sizeof(m_adv_uuids) / sizeof(m_adv_uuids[0]);
     init.advdata.uuids_complete.p_uuids  = m_adv_uuids;
 
+    //init.config.ble_adv_on_disconnect_disabled = true;
     init.config.ble_adv_whitelist_enabled = true;
     init.config.ble_adv_fast_enabled  = true;
     init.config.ble_adv_fast_interval = ADV_INTERVAL;
@@ -1361,10 +1477,6 @@ static void advertising_init(void)
     ble_advertising_conn_cfg_tag_set(&m_advertising, APP_BLE_CONN_CFG_TAG);
 }
 
-void scan_stop()
-{
-    nrf_ble_scan_stop();
-}
 
 
 /**@Function for verification of the error code.
